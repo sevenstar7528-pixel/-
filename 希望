@@ -1,0 +1,2751 @@
+// ==UserScript==
+// @name         放置希望 改機面板 v3
+// @namespace    idle-seal-cheat-panel
+// @version      3.0.0
+// @description  放置希望改機面板：倍率調整、寵物進化、寵物+9、裝備+12、能力值設定；支援收合、手機觸控拖曳與面板縮放
+// @author       ChatGPT
+// @match        https://idle-seal.pp771007.workers.dev/*
+// @run-at       document-idle
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        unsafeWindow
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    /* =========================================================
+       設定
+    ========================================================= */
+
+    const STORE_KEY = 'idle_seal_mults_v3';
+
+    const DEFAULTS = {
+        moveSpeed: 5,
+        gold: 5,
+        exp: 5,
+        dmg: 5,
+        respawn: 5,
+        fame: 5,
+        drop: 5
+    };
+
+    const TOGGLE_KEY = 'idle_seal_toggles_v3';
+
+    const TOGGLE_DEFAULTS = {
+        skipEvolveMaterials: false,
+        maxPetGrow: false,
+        maxRefine: false
+    };
+
+    const PANEL_KEY = 'idle_seal_panel_v3';
+
+    /* =========================================================
+       儲存
+    ========================================================= */
+
+    function loadMults() {
+        try {
+            const saved = GM_getValue(STORE_KEY, null);
+
+            if (saved && typeof saved === 'object') {
+                return Object.assign({}, DEFAULTS, saved);
+            }
+        } catch (e) {}
+
+        return Object.assign({}, DEFAULTS);
+    }
+
+    function saveMults() {
+        try {
+            GM_setValue(STORE_KEY, mults);
+        } catch (e) {}
+    }
+
+    function loadToggles() {
+        try {
+            const saved = GM_getValue(TOGGLE_KEY, null);
+
+            if (saved && typeof saved === 'object') {
+                return Object.assign({}, TOGGLE_DEFAULTS, saved);
+            }
+        } catch (e) {}
+
+        return Object.assign({}, TOGGLE_DEFAULTS);
+    }
+
+    function saveToggles() {
+        try {
+            GM_setValue(TOGGLE_KEY, toggles);
+        } catch (e) {}
+    }
+
+    function loadPanelData() {
+        try {
+            const saved = GM_getValue(PANEL_KEY, null);
+
+            if (saved && typeof saved === 'object') {
+                return saved;
+            }
+        } catch (e) {}
+
+        return {
+            left: null,
+            top: 80,
+            width: 300,
+            collapsed: false
+        };
+    }
+
+    function savePanelData() {
+        try {
+            GM_setValue(PANEL_KEY, panelData);
+        } catch (e) {}
+    }
+
+    let mults = loadMults();
+    let toggles = loadToggles();
+    let panelData = loadPanelData();
+
+    /* =========================================================
+       Session
+    ========================================================= */
+
+    let session = null;
+
+    let patchState = {
+        active: false,
+        proto: null
+    };
+
+    let locateTimer = null;
+
+    /* =========================================================
+       工具
+    ========================================================= */
+
+    function getWindow() {
+        return typeof unsafeWindow !== 'undefined'
+            ? unsafeWindow
+            : window;
+    }
+
+    function log(...args) {
+        console.log('[idle-seal v3]', ...args);
+    }
+
+    function warn(...args) {
+        console.warn('[idle-seal v3]', ...args);
+    }
+
+    function isObject(v) {
+        return v !== null && typeof v === 'object';
+    }
+
+    function looksLikeSession(obj) {
+        return isObject(obj)
+            && typeof obj.moveSpeed === 'function'
+            && typeof obj.wornItems === 'function'
+            && typeof obj.tick === 'function';
+    }
+
+    /* =========================================================
+       搜尋 Session
+    ========================================================= */
+
+    function scanObjectGraph(root, maxDepth = 8, maxNodes = 50000) {
+
+        const seen = new Set();
+
+        const queue = [
+            [root, 0]
+        ];
+
+        let count = 0;
+
+        while (queue.length) {
+
+            const item = queue.shift();
+
+            const obj = item[0];
+            const depth = item[1];
+
+            if (!obj || typeof obj !== 'object') {
+                continue;
+            }
+
+            if (seen.has(obj)) {
+                continue;
+            }
+
+            seen.add(obj);
+
+            count++;
+
+            if (count > maxNodes) {
+                break;
+            }
+
+            try {
+                if (looksLikeSession(obj)) {
+                    return obj;
+                }
+            } catch (e) {}
+
+            if (depth >= maxDepth) {
+                continue;
+            }
+
+            let keys;
+
+            try {
+                keys = Object.keys(obj);
+            } catch (e) {
+                continue;
+            }
+
+            for (const key of keys) {
+
+                let value;
+
+                try {
+                    value = obj[key];
+                } catch (e) {
+                    continue;
+                }
+
+                if (
+                    value &&
+                    typeof value === 'object' &&
+                    !seen.has(value)
+                ) {
+                    queue.push([
+                        value,
+                        depth + 1
+                    ]);
+                }
+            }
+        }
+
+        return null;
+    }
+
+    function findVueRoots() {
+
+        const roots = [];
+
+        let elements;
+
+        try {
+            elements = document.querySelectorAll('*');
+        } catch (e) {
+            return roots;
+        }
+
+        for (const el of elements) {
+
+            let keys;
+
+            try {
+                keys = Object.keys(el);
+            } catch (e) {
+                continue;
+            }
+
+            for (const key of keys) {
+
+                if (
+                    key.indexOf('__vue') === 0 ||
+                    key.indexOf('__vnode') === 0
+                ) {
+
+                    try {
+                        const value = el[key];
+
+                        if (value) {
+                            roots.push(value);
+                        }
+                    } catch (e) {}
+                }
+            }
+        }
+
+        return roots;
+    }
+
+    function locateSession() {
+
+        const uw = getWindow();
+
+        /* 手動 session */
+        try {
+            if (
+                uw.__idleSealManualSession &&
+                looksLikeSession(uw.__idleSealManualSession)
+            ) {
+                return uw.__idleSealManualSession;
+            }
+        } catch (e) {}
+
+        /* 已找到的 session */
+        try {
+            if (
+                uw.__idleSealSession &&
+                looksLikeSession(uw.__idleSealSession)
+            ) {
+                return uw.__idleSealSession;
+            }
+        } catch (e) {}
+
+        /* Vue */
+        const roots = findVueRoots();
+
+        for (const root of roots) {
+
+            const found = scanObjectGraph(
+                root,
+                8,
+                50000
+            );
+
+            if (found) {
+                return found;
+            }
+        }
+
+        return null;
+    }
+
+    /* =========================================================
+       Patch 工具
+    ========================================================= */
+
+    function markOriginal(proto, name, fn) {
+
+        const key = '__idleSealV3_original_' + name;
+
+        if (!proto[key]) {
+            try {
+                Object.defineProperty(proto, key, {
+                    value: fn,
+                    writable: true,
+                    configurable: true
+                });
+            } catch (e) {
+                proto[key] = fn;
+            }
+        }
+
+        return proto[key];
+    }
+
+    function getOriginal(proto, name) {
+
+        const key = '__idleSealV3_original_' + name;
+
+        try {
+            return proto[key] || null;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    function alreadyPatched(proto, name) {
+
+        try {
+            return !!proto['__idleSealV3_patch_' + name];
+        } catch (e) {
+            return false;
+        }
+    }
+
+    function markPatched(proto, name) {
+
+        try {
+            Object.defineProperty(
+                proto,
+                '__idleSealV3_patch_' + name,
+                {
+                    value: true,
+                    writable: true,
+                    configurable: true
+                }
+            );
+        } catch (e) {
+
+            try {
+                proto['__idleSealV3_patch_' + name] = true;
+            } catch (err) {}
+        }
+    }
+
+    /* =========================================================
+       套用 Patch
+    ========================================================= */
+
+    function applyPatches(s) {
+
+        if (!s) {
+            return false;
+        }
+
+        let proto;
+
+        try {
+            proto = Object.getPrototypeOf(s);
+        } catch (e) {
+            return false;
+        }
+
+        if (!proto) {
+            return false;
+        }
+
+        patchState.proto = proto;
+
+        /* -----------------------------------------------------
+           移動速度
+        ----------------------------------------------------- */
+
+        if (
+            typeof proto.moveSpeed === 'function' &&
+            !alreadyPatched(proto, 'moveSpeed')
+        ) {
+
+            const original = markOriginal(
+                proto,
+                'moveSpeed',
+                proto.moveSpeed
+            );
+
+            proto.moveSpeed = function (...args) {
+
+                const value = original.apply(
+                    this,
+                    args
+                );
+
+                try {
+
+                    const multiplier =
+                        Number(mults.moveSpeed) || 1;
+
+                    return Math.round(
+                        value * multiplier
+                    );
+
+                } catch (e) {
+
+                    return value;
+                }
+            };
+
+            markPatched(proto, 'moveSpeed');
+        }
+
+        /* -----------------------------------------------------
+           經驗
+        ----------------------------------------------------- */
+
+        if (
+            typeof proto.expPerKill === 'function' &&
+            !alreadyPatched(proto, 'expPerKill')
+        ) {
+
+            const original = markOriginal(
+                proto,
+                'expPerKill',
+                proto.expPerKill
+            );
+
+            proto.expPerKill = function (...args) {
+
+                const value = original.apply(
+                    this,
+                    args
+                );
+
+                try {
+
+                    const multiplier =
+                        Number(mults.exp) || 1;
+
+                    return Math.max(
+                        1,
+                        Math.round(
+                            value * multiplier
+                        )
+                    );
+
+                } catch (e) {
+
+                    return value;
+                }
+            };
+
+            markPatched(proto, 'expPerKill');
+        }
+
+        /* -----------------------------------------------------
+           金錢
+        ----------------------------------------------------- */
+
+        if (
+            typeof proto.sellSweep === 'function' &&
+            !alreadyPatched(proto, 'sellSweep')
+        ) {
+
+            const original = markOriginal(
+                proto,
+                'sellSweep',
+                proto.sellSweep
+            );
+
+            proto.sellSweep = function (...args) {
+
+                let before = 0;
+
+                try {
+
+                    if (this.player) {
+                        before =
+                            Number(
+                                this.player.gold
+                            ) || 0;
+                    }
+
+                } catch (e) {}
+
+                const result =
+                    original.apply(
+                        this,
+                        args
+                    );
+
+                try {
+
+                    if (
+                        this.player &&
+                        typeof this.player.gold === 'number'
+                    ) {
+
+                        const delta =
+                            this.player.gold - before;
+
+                        const multiplier =
+                            Number(mults.gold) || 1;
+
+                        if (
+                            delta > 0 &&
+                            multiplier > 1
+                        ) {
+
+                            this.player.gold +=
+                                Math.round(
+                                    delta *
+                                    (multiplier - 1)
+                                );
+                        }
+                    }
+
+                } catch (e) {
+
+                    warn(
+                        '金錢倍率處理失敗',
+                        e
+                    );
+                }
+
+                return result;
+            };
+
+            markPatched(proto, 'sellSweep');
+        }
+
+        /* -----------------------------------------------------
+           傷害
+        ----------------------------------------------------- */
+
+        if (
+            typeof proto.tick === 'function' &&
+            !alreadyPatched(proto, 'tick')
+        ) {
+
+            const original = markOriginal(
+                proto,
+                'tick',
+                proto.tick
+            );
+
+            proto.tick = function (...args) {
+
+                let backup = [];
+
+                const multiplier =
+                    Number(mults.dmg) || 1;
+
+                try {
+
+                    if (
+                        multiplier > 1 &&
+                        this.battle &&
+                        Array.isArray(
+                            this.battle.units
+                        )
+                    ) {
+
+                        for (
+                            const unit
+                            of this.battle.units
+                        ) {
+
+                            if (
+                                unit.side === 'ally' &&
+                                unit.stats &&
+                                typeof unit.stats.atk === 'number'
+                            ) {
+
+                                backup.push([
+                                    unit,
+                                    unit.stats.atk
+                                ]);
+
+                                unit.stats.atk =
+                                    Math.round(
+                                        unit.stats.atk *
+                                        multiplier
+                                    );
+                            }
+                        }
+                    }
+
+                } catch (e) {
+
+                    backup = [];
+
+                    warn(
+                        '傷害倍率前置失敗',
+                        e
+                    );
+                }
+
+                let result;
+
+                try {
+
+                    result =
+                        original.apply(
+                            this,
+                            args
+                        );
+
+                } finally {
+
+                    try {
+
+                        for (
+                            const pair
+                            of backup
+                        ) {
+
+                            pair[0].stats.atk =
+                                pair[1];
+                        }
+
+                    } catch (e) {}
+                }
+
+                /* 寵物材料 */
+                try {
+
+                    if (
+                        toggles.skipEvolveMaterials &&
+                        Array.isArray(this.pets) &&
+                        this.data &&
+                        this.data.petById
+                    ) {
+
+                        for (
+                            const pet
+                            of this.pets
+                        ) {
+
+                            const def =
+                                this.data.petById.get(
+                                    pet.id
+                                );
+
+                            if (!def) {
+                                continue;
+                            }
+
+                            if (
+                                typeof pet.grow === 'number' &&
+                                pet.grow < 9
+                            ) {
+
+                                pet.grow = 9;
+                            }
+
+                            if (
+                                typeof def.feedFull === 'number' &&
+                                typeof pet.exp === 'number' &&
+                                pet.exp < def.feedFull
+                            ) {
+
+                                pet.exp =
+                                    def.feedFull;
+                            }
+                        }
+                    }
+
+                } catch (e) {}
+
+                return result;
+            };
+
+            markPatched(proto, 'tick');
+        }
+
+        /* -----------------------------------------------------
+           重生
+        ----------------------------------------------------- */
+
+        if (
+            typeof proto.tickRespawns === 'function' &&
+            !alreadyPatched(proto, 'tickRespawns')
+        ) {
+
+            const original =
+                markOriginal(
+                    proto,
+                    'tickRespawns',
+                    proto.tickRespawns
+                );
+
+            let lastTime = null;
+
+            proto.tickRespawns =
+                function (...args) {
+
+                    const result =
+                        original.apply(
+                            this,
+                            args
+                        );
+
+                    try {
+
+                        const now =
+                            performance.now();
+
+                        const dt =
+                            lastTime === null
+                                ? 0
+                                : now - lastTime;
+
+                        lastTime = now;
+
+                        const multiplier =
+                            Number(mults.respawn) || 1;
+
+                        if (
+                            multiplier > 1 &&
+                            dt > 0 &&
+                            Array.isArray(this.instances)
+                        ) {
+
+                            const extra =
+                                dt *
+                                (multiplier - 1);
+
+                            for (
+                                const enemy
+                                of this.instances
+                            ) {
+
+                                if (
+                                    !enemy.alive &&
+                                    typeof enemy.respawnMs === 'number' &&
+                                    enemy.respawnMs > 0
+                                ) {
+
+                                    enemy.respawnMs =
+                                        Math.max(
+                                            0,
+                                            enemy.respawnMs -
+                                            extra
+                                        );
+
+                                    if (
+                                        enemy.respawnMs <= 0
+                                    ) {
+
+                                        enemy.alive = true;
+                                        enemy.respawnMs = 0;
+
+                                        this.dirty = true;
+                                    }
+                                }
+                            }
+                        }
+
+                    } catch (e) {}
+
+                    return result;
+                };
+
+            markPatched(
+                proto,
+                'tickRespawns'
+            );
+        }
+
+        /* -----------------------------------------------------
+           掉寶
+        ----------------------------------------------------- */
+
+        if (
+            typeof proto.rewardKill === 'function' &&
+            typeof proto.give === 'function' &&
+            !alreadyPatched(proto, 'rewardKill')
+        ) {
+
+            const original =
+                markOriginal(
+                    proto,
+                    'rewardKill',
+                    proto.rewardKill
+                );
+
+            proto.rewardKill =
+                function (...args) {
+
+                    let before = null;
+
+                    try {
+
+                        if (
+                            this.drops &&
+                            typeof this.drops.forEach ===
+                            'function'
+                        ) {
+
+                            before =
+                                new Map(
+                                    this.drops
+                                );
+                        }
+
+                    } catch (e) {}
+
+                    const result =
+                        original.apply(
+                            this,
+                            args
+                        );
+
+                    try {
+
+                        const multiplier =
+                            Number(mults.drop) || 1;
+
+                        if (
+                            before &&
+                            this.drops &&
+                            multiplier > 1
+                        ) {
+
+                            for (
+                                const [
+                                    itemId,
+                                    afterCount
+                                ]
+                                of this.drops
+                            ) {
+
+                                const beforeCount =
+                                    before.get(
+                                        itemId
+                                    ) ?? 0;
+
+                                const gained =
+                                    afterCount -
+                                    beforeCount;
+
+                                if (gained > 0) {
+
+                                    const extra =
+                                        Math.round(
+                                            gained *
+                                            (multiplier - 1)
+                                        );
+
+                                    if (extra > 0) {
+
+                                        this.give(
+                                            itemId,
+                                            extra
+                                        );
+
+                                        this.drops.set(
+                                            itemId,
+                                            (
+                                                this.drops.get(
+                                                    itemId
+                                                ) ?? 0
+                                            ) + extra
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
+                    } catch (e) {}
+
+                    return result;
+                };
+
+            markPatched(
+                proto,
+                'rewardKill'
+            );
+        }
+
+        /* -----------------------------------------------------
+           名聲
+        ----------------------------------------------------- */
+
+        if (
+            typeof proto.submitQuest === 'function' &&
+            !alreadyPatched(proto, 'submitQuest')
+        ) {
+
+            const original =
+                markOriginal(
+                    proto,
+                    'submitQuest',
+                    proto.submitQuest
+                );
+
+            proto.submitQuest =
+                function (...args) {
+
+                    let beforeCurrent = 0;
+                    let beforeTotal = 0;
+
+                    try {
+
+                        if (
+                            this.player &&
+                            this.player.fame
+                        ) {
+
+                            beforeCurrent =
+                                Number(
+                                    this.player.fame.current
+                                ) || 0;
+
+                            beforeTotal =
+                                Number(
+                                    this.player.fame.total
+                                ) || 0;
+                        }
+
+                    } catch (e) {}
+
+                    const result =
+                        original.apply(
+                            this,
+                            args
+                        );
+
+                    try {
+
+                        const multiplier =
+                            Number(mults.fame) || 1;
+
+                        if (
+                            multiplier > 1 &&
+                            this.player &&
+                            this.player.fame
+                        ) {
+
+                            const deltaCurrent =
+                                this.player.fame.current -
+                                beforeCurrent;
+
+                            const deltaTotal =
+                                this.player.fame.total -
+                                beforeTotal;
+
+                            if (deltaCurrent > 0) {
+
+                                this.player.fame.current +=
+                                    Math.round(
+                                        deltaCurrent *
+                                        (multiplier - 1)
+                                    );
+                            }
+
+                            if (deltaTotal > 0) {
+
+                                this.player.fame.total +=
+                                    Math.round(
+                                        deltaTotal *
+                                        (multiplier - 1)
+                                    );
+                            }
+                        }
+
+                    } catch (e) {}
+
+                    return result;
+                };
+
+            markPatched(
+                proto,
+                'submitQuest'
+            );
+        }
+
+        /* -----------------------------------------------------
+           buildPetView
+        ----------------------------------------------------- */
+
+        if (
+            typeof proto.buildPetView === 'function' &&
+            !alreadyPatched(proto, 'buildPetView')
+        ) {
+
+            const original =
+                markOriginal(
+                    proto,
+                    'buildPetView',
+                    proto.buildPetView
+                );
+
+            proto.buildPetView =
+                function (...args) {
+
+                    const result =
+                        original.apply(
+                            this,
+                            args
+                        );
+
+                    try {
+
+                        if (
+                            toggles.skipEvolveMaterials &&
+                            result &&
+                            Array.isArray(
+                                result.targets
+                            )
+                        ) {
+
+                            for (
+                                const target
+                                of result.targets
+                            ) {
+
+                                target.blocked = false;
+
+                                if (
+                                    typeof target.need ===
+                                    'number'
+                                ) {
+
+                                    target.have =
+                                        target.need;
+                                }
+                            }
+                        }
+
+                    } catch (e) {}
+
+                    return result;
+                };
+
+            markPatched(
+                proto,
+                'buildPetView'
+            );
+        }
+
+        /* -----------------------------------------------------
+           countOf
+        ----------------------------------------------------- */
+
+        if (
+            typeof proto.countOf === 'function' &&
+            !alreadyPatched(proto, 'countOf')
+        ) {
+
+            const original =
+                markOriginal(
+                    proto,
+                    'countOf',
+                    proto.countOf
+                );
+
+            proto.countOf =
+                function (...args) {
+
+                    if (
+                        toggles.skipEvolveMaterials
+                    ) {
+
+                        return Infinity;
+                    }
+
+                    return original.apply(
+                        this,
+                        args
+                    );
+                };
+
+            markPatched(
+                proto,
+                'countOf'
+            );
+        }
+
+        /* -----------------------------------------------------
+           take
+        ----------------------------------------------------- */
+
+        if (
+            typeof proto.take === 'function' &&
+            !alreadyPatched(proto, 'take')
+        ) {
+
+            const original =
+                markOriginal(
+                    proto,
+                    'take',
+                    proto.take
+                );
+
+            proto.take =
+                function (...args) {
+
+                    if (
+                        toggles.skipEvolveMaterials
+                    ) {
+
+                        return;
+                    }
+
+                    return original.apply(
+                        this,
+                        args
+                    );
+                };
+
+            markPatched(
+                proto,
+                'take'
+            );
+        }
+
+        /* -----------------------------------------------------
+           replacePet
+        ----------------------------------------------------- */
+
+        if (
+            typeof proto.replacePet === 'function' &&
+            !alreadyPatched(proto, 'replacePet')
+        ) {
+
+            const original =
+                markOriginal(
+                    proto,
+                    'replacePet',
+                    proto.replacePet
+                );
+
+            proto.replacePet =
+                function (e) {
+
+                    try {
+
+                        if (
+                            toggles.maxPetGrow &&
+                            e &&
+                            typeof e.grow === 'number' &&
+                            e.grow < 9
+                        ) {
+
+                            e = Object.assign(
+                                {},
+                                e,
+                                {
+                                    grow: 9
+                                }
+                            );
+                        }
+
+                    } catch (err) {}
+
+                    return original.call(
+                        this,
+                        e
+                    );
+                };
+
+            markPatched(
+                proto,
+                'replacePet'
+            );
+        }
+
+        /* -----------------------------------------------------
+           refineStack
+        ----------------------------------------------------- */
+
+        if (
+            typeof proto.refineStack === 'function' &&
+            !alreadyPatched(proto, 'refineStack')
+        ) {
+
+            const original =
+                markOriginal(
+                    proto,
+                    'refineStack',
+                    proto.refineStack
+                );
+
+            proto.refineStack =
+                function (e) {
+
+                    if (!toggles.maxRefine) {
+
+                        return original.call(
+                            this,
+                            e
+                        );
+                    }
+
+                    try {
+
+                        if (!this.inVillage) {
+                            return;
+                        }
+
+                        const stack =
+                            this.player &&
+                            this.player.stacks
+                                ? this.player.stacks.get(e)
+                                : null;
+
+                        if (
+                            !stack ||
+                            stack.locked ||
+                            !this.data ||
+                            !this.data.equipById ||
+                            !this.data.equipById.has(
+                                stack.itemId
+                            )
+                        ) {
+
+                            return;
+                        }
+
+                        const name =
+                            typeof this.itemName ===
+                            'function'
+                                ? this.itemName(
+                                    stack.itemId
+                                )
+                                : '裝備';
+
+                        stack.refine = 12;
+
+                        if (
+                            typeof this.push ===
+                            'function'
+                        ) {
+
+                            this.push(
+                                `${name} 精煉成功 → +12`,
+                                'equip'
+                            );
+                        }
+
+                        if (
+                            typeof this.cue ===
+                            'function'
+                        ) {
+
+                            this.cue(
+                                'success'
+                            );
+                        }
+
+                        if (
+                            typeof this.refreshPlayerStats ===
+                            'function'
+                        ) {
+
+                            this.refreshPlayerStats();
+                        }
+
+                        if (
+                            typeof this.applyNow ===
+                            'function'
+                        ) {
+
+                            this.applyNow();
+                        }
+
+                    } catch (err) {
+
+                        warn(
+                            '精煉補丁失敗',
+                            err
+                        );
+
+                        return original.call(
+                            this,
+                            e
+                        );
+                    }
+                };
+
+            markPatched(
+                proto,
+                'refineStack'
+            );
+        }
+
+        patchState.active = true;
+
+        try {
+            getWindow().__idleSealSession = s;
+        } catch (e) {}
+
+        log(
+            'Patch 完成',
+            Object.assign({}, mults)
+        );
+
+        updateStatus(
+            '✅ 已套用 Patch'
+        );
+
+        return true;
+    }
+
+    /* =========================================================
+       尋找 Session Loop
+    ========================================================= */
+
+    function tryFindSession() {
+
+        const found =
+            locateSession();
+
+        if (!found) {
+
+            patchState.active = false;
+
+            updateStatus(
+                '⏳ 尋找遊戲 session 中...'
+            );
+
+            return false;
+        }
+
+        if (
+            session !== found ||
+            !patchState.active
+        ) {
+
+            session = found;
+
+            try {
+                getWindow().__idleSealSession =
+                    found;
+            } catch (e) {}
+
+            applyPatches(found);
+
+            return true;
+        }
+
+        return true;
+    }
+
+    function startSessionWatcher() {
+
+        if (locateTimer) {
+            clearInterval(locateTimer);
+        }
+
+        locateTimer =
+            setInterval(() => {
+
+                try {
+                    tryFindSession();
+                } catch (e) {
+                    warn(
+                        'Session watcher error',
+                        e
+                    );
+                }
+
+            }, 1500);
+
+        tryFindSession();
+    }
+
+    /* =========================================================
+       UI
+    ========================================================= */
+
+    let panel = null;
+    let body = null;
+    let statusEl = null;
+    let sizeLabel = null;
+
+    function updateStatus(text) {
+
+        if (statusEl) {
+            statusEl.textContent =
+                text;
+        }
+    }
+
+    function createElement(
+        tag,
+        text = ''
+    ) {
+
+        const el =
+            document.createElement(tag);
+
+        if (text) {
+            el.textContent = text;
+        }
+
+        return el;
+    }
+
+    function buildPanel() {
+
+        panel =
+            createElement('div');
+
+        panel.id =
+            'idle-seal-cheat-panel-v3';
+
+        panel.style.cssText = `
+            position: fixed;
+            z-index: 2147483647;
+
+            top: ${panelData.top || 80}px;
+
+            ${
+                panelData.left !== null
+                    ? `left:${panelData.left}px;right:auto;`
+                    : `right:20px;`
+            }
+
+            width: ${panelData.width || 300}px;
+
+            min-width: 220px;
+            max-width: 90vw;
+
+            max-height: 80vh;
+
+            background:#1c1712;
+            color:#eee;
+
+            border:1px solid #5a4937;
+            border-radius:10px;
+
+            box-shadow:
+                0 5px 25px rgba(0,0,0,.55);
+
+            font-family:
+                -apple-system,
+                BlinkMacSystemFont,
+                "Microsoft JhengHei",
+                sans-serif;
+
+            font-size:13px;
+
+            overflow:hidden;
+
+            display:flex;
+            flex-direction:column;
+
+            user-select:none;
+
+            resize:both;
+        `;
+
+        /* =====================================================
+           Header
+        ===================================================== */
+
+        const header =
+            createElement(
+                'div'
+            );
+
+        header.style.cssText = `
+            min-height:42px;
+            padding:0 8px 0 12px;
+
+            background:#2a221a;
+
+            border-bottom:
+                1px solid #4a3f33;
+
+            display:flex;
+            align-items:center;
+
+            gap:6px;
+
+            flex-shrink:0;
+
+            touch-action:none;
+        `;
+
+        const title =
+            createElement(
+                'div',
+                '放置希望 改機 v3'
+            );
+
+        title.style.cssText = `
+            font-weight:bold;
+            flex:1;
+            cursor:move;
+            line-height:42px;
+        `;
+
+        header.appendChild(title);
+
+        const collapseBtn =
+            createElement(
+                'button',
+                panelData.collapsed
+                    ? '＋'
+                    : '－'
+            );
+
+        collapseBtn.style.cssText = `
+            width:32px;
+            height:30px;
+
+            border:0;
+            border-radius:5px;
+
+            background:#4a3827;
+            color:#fff;
+
+            font-size:18px;
+
+            cursor:pointer;
+
+            flex-shrink:0;
+        `;
+
+        header.appendChild(
+            collapseBtn
+        );
+
+        panel.appendChild(
+            header
+        );
+
+        /* =====================================================
+           Body
+        ===================================================== */
+
+        body =
+            createElement(
+                'div'
+            );
+
+        body.style.cssText = `
+            padding:12px;
+
+            overflow-y:auto;
+
+            flex:1;
+
+            -webkit-overflow-scrolling:touch;
+
+            box-sizing:border-box;
+        `;
+
+        panel.appendChild(
+            body
+        );
+
+        /* =====================================================
+           收合
+        ===================================================== */
+
+        function setCollapsed(
+            value
+        ) {
+
+            panelData.collapsed =
+                !!value;
+
+            body.style.display =
+                panelData.collapsed
+                    ? 'none'
+                    : 'block';
+
+            collapseBtn.textContent =
+                panelData.collapsed
+                    ? '＋'
+                    : '－';
+
+            savePanelData();
+        }
+
+        collapseBtn.addEventListener(
+            'click',
+            () => {
+
+                setCollapsed(
+                    !panelData.collapsed
+                );
+            }
+        );
+
+        /* =====================================================
+           倍率區
+        ===================================================== */
+
+        const multiplierTitle =
+            createElement(
+                'div',
+                '倍率調整'
+            );
+
+        multiplierTitle.style.cssText = `
+            font-weight:bold;
+            color:#e0b060;
+            margin-bottom:10px;
+        `;
+
+        body.appendChild(
+            multiplierTitle
+        );
+
+        const fields = [
+
+            {
+                key:'moveSpeed',
+                label:'移動速度'
+            },
+
+            {
+                key:'gold',
+                label:'金錢'
+            },
+
+            {
+                key:'exp',
+                label:'經驗'
+            },
+
+            {
+                key:'dmg',
+                label:'傷害'
+            },
+
+            {
+                key:'respawn',
+                label:'怪物重生速度'
+            },
+
+            {
+                key:'fame',
+                label:'名聲'
+            },
+
+            {
+                key:'drop',
+                label:'掉寶'
+            }
+
+        ];
+
+        fields.forEach(
+            field => {
+
+                const row =
+                    createElement(
+                        'div'
+                    );
+
+                row.style.cssText = `
+                    margin-bottom:10px;
+                `;
+
+                const labelRow =
+                    createElement(
+                        'div'
+                    );
+
+                labelRow.style.cssText = `
+                    display:flex;
+                    justify-content:space-between;
+                    margin-bottom:4px;
+                `;
+
+                const label =
+                    createElement(
+                        'span',
+                        field.label
+                    );
+
+                const value =
+                    createElement(
+                        'span',
+                        `${mults[field.key]}x`
+                    );
+
+                value.style.cssText = `
+                    color:#e0b060;
+                    font-weight:bold;
+                `;
+
+                labelRow.appendChild(
+                    label
+                );
+
+                labelRow.appendChild(
+                    value
+                );
+
+                row.appendChild(
+                    labelRow
+                );
+
+                const slider =
+                    createElement(
+                        'input'
+                    );
+
+                slider.type =
+                    'range';
+
+                slider.min =
+                    '1';
+
+                slider.max =
+                    '100';
+
+                slider.step =
+                    '1';
+
+                slider.value =
+                    String(
+                        mults[field.key]
+                    );
+
+                slider.style.cssText = `
+                    width:100%;
+                    height:24px;
+                    cursor:pointer;
+                    touch-action:auto;
+                `;
+
+                slider.addEventListener(
+                    'input',
+                    () => {
+
+                        const v =
+                            Number(
+                                slider.value
+                            );
+
+                        mults[field.key] =
+                            Math.max(
+                                1,
+                                Math.min(
+                                    100,
+                                    v
+                                )
+                            );
+
+                        value.textContent =
+                            `${mults[field.key]}x`;
+
+                        /*
+                         * 重要：
+                         * 不需要重新 patch。
+                         * Patch 內部直接讀 mults，
+                         * 所以這裡修改後下一次遊戲
+                         * 計算就會使用新的倍率。
+                         */
+                        saveMults();
+
+                        updateStatus(
+                            `✅ ${field.label}倍率已改為 ${mults[field.key]}x`
+                        );
+                    }
+                );
+
+                row.appendChild(
+                    slider
+                );
+
+                body.appendChild(
+                    row
+                );
+            }
+        );
+
+        /* =====================================================
+           狀態
+        ===================================================== */
+
+        statusEl =
+            createElement(
+                'div',
+                '⏳ 尋找遊戲 session 中...'
+            );
+
+        statusEl.style.cssText = `
+            min-height:18px;
+
+            margin:
+                8px 0;
+
+            color:#aaa;
+
+            font-size:12px;
+
+            line-height:18px;
+        `;
+
+        body.appendChild(
+            statusEl
+        );
+
+        /* =====================================================
+           功能開關
+        ===================================================== */
+
+        const functionTitle =
+            createElement(
+                'div',
+                '特殊功能'
+            );
+
+        functionTitle.style.cssText = `
+            font-weight:bold;
+            color:#e0b060;
+            margin:
+                8px 0;
+        `;
+
+        body.appendChild(
+            functionTitle
+        );
+
+        function addToggle(
+            key,
+            text
+        ) {
+
+            const row =
+                createElement(
+                    'label'
+                );
+
+            row.style.cssText = `
+                display:flex;
+                align-items:center;
+
+                gap:8px;
+
+                margin-bottom:8px;
+                padding:9px;
+
+                background:#241d16;
+
+                border-radius:5px;
+
+                cursor:pointer;
+
+                touch-action:manipulation;
+            `;
+
+            const checkbox =
+                createElement(
+                    'input'
+                );
+
+            checkbox.type =
+                'checkbox';
+
+            checkbox.checked =
+                !!toggles[key];
+
+            checkbox.style.cssText = `
+                width:18px;
+                height:18px;
+                flex-shrink:0;
+            `;
+
+            checkbox.addEventListener(
+                'change',
+                () => {
+
+                    toggles[key] =
+                        checkbox.checked;
+
+                    saveToggles();
+                }
+            );
+
+            const label =
+                createElement(
+                    'span',
+                    text
+                );
+
+            label.style.cssText = `
+                flex:1;
+            `;
+
+            row.appendChild(
+                checkbox
+            );
+
+            row.appendChild(
+                label
+            );
+
+            body.appendChild(
+                row
+            );
+        }
+
+        addToggle(
+            'skipEvolveMaterials',
+            '寵物進化跳過材料需求'
+        );
+
+        addToggle(
+            'maxPetGrow',
+            '寵物強化等級直接拉滿 (+9)'
+        );
+
+        addToggle(
+            'maxRefine',
+            '裝備強化必定成功 (+12)'
+        );
+
+        /* =====================================================
+           能力值
+        ===================================================== */
+
+        const attrTitle =
+            createElement(
+                'div',
+                '能力值直接設定'
+            );
+
+        attrTitle.style.cssText = `
+            font-weight:bold;
+            color:#e0b060;
+
+            margin:
+                12px 0 8px;
+        `;
+
+        body.appendChild(
+            attrTitle
+        );
+
+        const attrFields = [
+
+            {
+                key:'str',
+                label:'力量'
+            },
+
+            {
+                key:'agi',
+                label:'敏捷'
+            },
+
+            {
+                key:'int',
+                label:'智力'
+            },
+
+            {
+                key:'sta',
+                label:'體力'
+            },
+
+            {
+                key:'wis',
+                label:'精神'
+            },
+
+            {
+                key:'luck',
+                label:'幸運'
+            }
+
+        ];
+
+        const attrInputs = {};
+
+        const attrGrid =
+            createElement(
+                'div'
+            );
+
+        attrGrid.style.cssText = `
+            display:grid;
+
+            grid-template-columns:
+                1fr 1fr;
+
+            gap:8px;
+
+            margin-bottom:8px;
+        `;
+
+        attrFields.forEach(
+            field => {
+
+                const wrap =
+                    createElement(
+                        'div'
+                    );
+
+                const label =
+                    createElement(
+                        'div',
+                        field.label
+                    );
+
+                label.style.cssText = `
+                    color:#999;
+                    font-size:11px;
+                    margin-bottom:3px;
+                `;
+
+                const input =
+                    createElement(
+                        'input'
+                    );
+
+                input.type =
+                    'number';
+
+                input.min =
+                    '0';
+
+                input.inputMode =
+                    'numeric';
+
+                input.placeholder =
+                    '0';
+
+                input.style.cssText = `
+                    width:100%;
+                    box-sizing:border-box;
+
+                    padding:7px;
+
+                    background:#100d09;
+
+                    border:
+                        1px solid #4a3f33;
+
+                    border-radius:4px;
+
+                    color:#fff;
+
+                    font-size:14px;
+                `;
+
+                wrap.appendChild(
+                    label
+                );
+
+                wrap.appendChild(
+                    input
+                );
+
+                attrGrid.appendChild(
+                    wrap
+                );
+
+                attrInputs[
+                    field.key
+                ] = input;
+            }
+        );
+
+        body.appendChild(
+            attrGrid
+        );
+
+        const attrStatus =
+            createElement(
+                'div'
+            );
+
+        attrStatus.style.cssText = `
+            color:#999;
+            font-size:12px;
+            min-height:18px;
+            margin-bottom:8px;
+        `;
+
+        body.appendChild(
+            attrStatus
+        );
+
+        const attrButtons =
+            createElement(
+                'div'
+            );
+
+        attrButtons.style.cssText = `
+            display:flex;
+            gap:8px;
+            margin-bottom:10px;
+        `;
+
+        const loadBtn =
+            createElement(
+                'button',
+                '讀取目前數值'
+            );
+
+        const applyBtn =
+            createElement(
+                'button',
+                '套用'
+            );
+
+        [loadBtn, applyBtn]
+            .forEach(
+                button => {
+
+                    button.style.cssText = `
+                        flex:1;
+
+                        padding:9px;
+
+                        border:0;
+
+                        border-radius:5px;
+
+                        color:#fff;
+
+                        background:#493727;
+
+                        cursor:pointer;
+
+                        font-size:12px;
+
+                        touch-action:manipulation;
+                    `;
+                }
+            );
+
+        loadBtn.addEventListener(
+            'click',
+            () => {
+
+                if (
+                    !session ||
+                    !session.player ||
+                    !session.player.attributes
+                ) {
+
+                    attrStatus.textContent =
+                        '❌ 尚未找到 session';
+
+                    return;
+                }
+
+                const a =
+                    session.player.attributes;
+
+                attrFields.forEach(
+                    field => {
+
+                        attrInputs[
+                            field.key
+                        ].value =
+                            a[field.key] ?? 0;
+                    }
+                );
+
+                attrStatus.textContent =
+                    '✅ 已讀取';
+            }
+        );
+
+        applyBtn.addEventListener(
+            'click',
+            () => {
+
+                if (
+                    !session ||
+                    !session.player
+                ) {
+
+                    attrStatus.textContent =
+                        '❌ 尚未找到 session';
+
+                    return;
+                }
+
+                try {
+
+                    const next = {};
+
+                    attrFields.forEach(
+                        field => {
+
+                            next[field.key] =
+                                Math.max(
+                                    0,
+                                    Math.floor(
+                                        Number(
+                                            attrInputs[
+                                                field.key
+                                            ].value
+                                        ) || 0
+                                    )
+                                );
+                        }
+                    );
+
+                    session.player.attributes =
+                        next;
+
+                    if (
+                        typeof session.refreshPlayerStats ===
+                        'function'
+                    ) {
+
+                        session.refreshPlayerStats();
+                    }
+
+                    attrStatus.textContent =
+                        '✅ 已套用';
+
+                } catch (e) {
+
+                    attrStatus.textContent =
+                        '❌ 套用失敗';
+
+                    warn(
+                        '能力值設定錯誤',
+                        e
+                    );
+                }
+            }
+        );
+
+        attrButtons.appendChild(
+            loadBtn
+        );
+
+        attrButtons.appendChild(
+            applyBtn
+        );
+
+        body.appendChild(
+            attrButtons
+        );
+
+        /* =====================================================
+           按鈕
+        ===================================================== */
+
+        const retryBtn =
+            createElement(
+                'button',
+                '🔄 重新尋找並套用'
+            );
+
+        retryBtn.style.cssText = `
+            width:100%;
+
+            padding:9px;
+
+            border:0;
+
+            border-radius:5px;
+
+            background:#5a3d1f;
+
+            color:#fff;
+
+            cursor:pointer;
+
+            font-size:13px;
+
+            touch-action:manipulation;
+        `;
+
+        retryBtn.addEventListener(
+            'click',
+            () => {
+
+                patchState.active =
+                    false;
+
+                session = null;
+
+                updateStatus(
+                    '⏳ 正在重新尋找...'
+                );
+
+                tryFindSession();
+            }
+        );
+
+        body.appendChild(
+            retryBtn
+        );
+
+        /* =====================================================
+           縮放資訊
+        ===================================================== */
+
+        sizeLabel =
+            createElement(
+                'div'
+            );
+
+        sizeLabel.style.cssText = `
+            text-align:right;
+
+            color:#666;
+
+            font-size:10px;
+
+            margin-top:6px;
+        `;
+
+        sizeLabel.textContent =
+            '可從右下角拖曳縮放';
+
+        body.appendChild(
+            sizeLabel
+        );
+
+        /* =====================================================
+           拖曳
+        ===================================================== */
+
+        setupDrag(
+            panel,
+            title
+        );
+
+        /* =====================================================
+           ResizeObserver
+        ===================================================== */
+
+        if (
+            typeof ResizeObserver !==
+            'undefined'
+        ) {
+
+            const observer =
+                new ResizeObserver(
+                    () => {
+
+                        if (!panel) {
+                            return;
+                        }
+
+                        panelData.width =
+                            panel.offsetWidth;
+
+                        savePanelData();
+                    }
+                );
+
+            observer.observe(
+                panel
+            );
+        }
+
+        /* =====================================================
+           收合初始狀態
+        ===================================================== */
+
+        if (panelData.collapsed) {
+
+            body.style.display =
+                'none';
+        }
+
+        return panel;
+    }
+
+    /* =========================================================
+       拖曳
+    ========================================================= */
+
+    function setupDrag(
+        target,
+        handle
+    ) {
+
+        let dragging = false;
+
+        let startX = 0;
+        let startY = 0;
+
+        let startLeft = 0;
+        let startTop = 0;
+
+        function begin(e) {
+
+            if (
+                e.target &&
+                e.target.tagName ===
+                'BUTTON'
+            ) {
+                return;
+            }
+
+            dragging = true;
+
+            const point =
+                e.touches
+                    ? e.touches[0]
+                    : e;
+
+            startX =
+                point.clientX;
+
+            startY =
+                point.clientY;
+
+            const rect =
+                target.getBoundingClientRect();
+
+            startLeft =
+                rect.left;
+
+            startTop =
+                rect.top;
+
+            target.style.right =
+                'auto';
+
+            target.style.left =
+                startLeft + 'px';
+
+            target.style.top =
+                startTop + 'px';
+
+            if (
+                e.cancelable
+            ) {
+                e.preventDefault();
+            }
+        }
+
+        function move(e) {
+
+            if (!dragging) {
+                return;
+            }
+
+            const point =
+                e.touches
+                    ? e.touches[0]
+                    : e;
+
+            let left =
+                startLeft +
+                (
+                    point.clientX -
+                    startX
+                );
+
+            let top =
+                startTop +
+                (
+                    point.clientY -
+                    startY
+                );
+
+            const margin = 5;
+
+            left =
+                Math.max(
+                    margin,
+                    Math.min(
+                        window.innerWidth -
+                        target.offsetWidth -
+                        margin,
+                        left
+                    )
+                );
+
+            top =
+                Math.max(
+                    margin,
+                    Math.min(
+                        window.innerHeight -
+                        Math.min(
+                            target.offsetHeight,
+                            window.innerHeight
+                        ) -
+                        margin,
+                        top
+                    )
+                );
+
+            target.style.left =
+                left + 'px';
+
+            target.style.top =
+                top + 'px';
+
+            panelData.left =
+                left;
+
+            panelData.top =
+                top;
+        }
+
+        function end() {
+
+            if (!dragging) {
+                return;
+            }
+
+            dragging = false;
+
+            savePanelData();
+        }
+
+        /* PC */
+
+        handle.addEventListener(
+            'mousedown',
+            begin
+        );
+
+        document.addEventListener(
+            'mousemove',
+            move
+        );
+
+        document.addEventListener(
+            'mouseup',
+            end
+        );
+
+        /* 手機 */
+
+        handle.addEventListener(
+            'touchstart',
+            begin,
+            {
+                passive:false
+            }
+        );
+
+        document.addEventListener(
+            'touchmove',
+            move,
+            {
+                passive:false
+            }
+        );
+
+        document.addEventListener(
+            'touchend',
+            end
+        );
+    }
+
+    /* =========================================================
+       進化按鈕解除 disabled
+    ========================================================= */
+
+    function startDisabledButtonBypass() {
+
+        setInterval(
+            () => {
+
+                if (
+                    !toggles.skipEvolveMaterials
+                ) {
+                    return;
+                }
+
+                try {
+
+                    const rows =
+                        document.querySelectorAll(
+                            '.evolve-row'
+                        );
+
+                    for (
+                        const row
+                        of rows
+                    ) {
+
+                        const button =
+                            row.querySelector(
+                                'button.primary-btn[disabled]'
+                            );
+
+                        if (button) {
+
+                            button.removeAttribute(
+                                'disabled'
+                            );
+                        }
+                    }
+
+                } catch (e) {}
+            },
+            300
+        );
+    }
+
+    /* =========================================================
+       防止手機畫面跑版
+    ========================================================= */
+
+    function mobileAdjust() {
+
+        if (!panel) {
+            return;
+        }
+
+        if (
+            window.innerWidth <= 600
+        ) {
+
+            panel.style.maxWidth =
+                'calc(100vw - 10px)';
+
+            panel.style.maxHeight =
+                '75vh';
+
+            if (
+                panel.offsetWidth >
+                window.innerWidth - 10
+            ) {
+
+                panel.style.width =
+                    Math.max(
+                        220,
+                        window.innerWidth -
+                        10
+                    ) + 'px';
+            }
+
+            const rect =
+                panel.getBoundingClientRect();
+
+            if (
+                rect.right >
+                window.innerWidth
+            ) {
+
+                panel.style.left =
+                    Math.max(
+                        5,
+                        window.innerWidth -
+                        panel.offsetWidth -
+                        5
+                    ) + 'px';
+
+                panel.style.right =
+                    'auto';
+            }
+
+            if (
+                rect.bottom >
+                window.innerHeight
+            ) {
+
+                panel.style.top =
+                    Math.max(
+                        5,
+                        window.innerHeight -
+                        panel.offsetHeight -
+                        5
+                    ) + 'px';
+            }
+        }
+    }
+
+    window.addEventListener(
+        'resize',
+        mobileAdjust
+    );
+
+    /* =========================================================
+       初始化
+    ========================================================= */
+
+    function mountPanel() {
+
+        if (
+            document.getElementById(
+                'idle-seal-cheat-panel-v3'
+            )
+        ) {
+            return;
+        }
+
+        document.body.appendChild(
+            buildPanel()
+        );
+
+        mobileAdjust();
+
+        startSessionWatcher();
+
+        startDisabledButtonBypass();
+
+        log(
+            'v3 面板已啟動'
+        );
+    }
+
+    if (
+        document.readyState ===
+        'loading'
+    ) {
+
+        document.addEventListener(
+            'DOMContentLoaded',
+            mountPanel
+        );
+
+    } else {
+
+        mountPanel();
+    }
+
+})();巫
